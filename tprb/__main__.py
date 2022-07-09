@@ -11,7 +11,7 @@ import urllib3
 import zipfile
 import zipimport
 
-__version__ = '0.2.0'
+__version__ = '0.3.0'
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logging.basicConfig()
@@ -22,6 +22,7 @@ class Version:
     name: str
     version: str
     key_id: str
+    key_ascii_armor: str
     protocols: list[str]
     shasums: str
     shasums_signature: str
@@ -86,8 +87,6 @@ class TFEClient:
 
 
 commands = {}
-
-
 def command(f):
     commands[f.__name__] = f
 
@@ -142,6 +141,7 @@ def _bundle_provider(session, archive, name, os, arch):
                 name,
                 v['version'],
                 package['signing_keys']['gpg_public_keys'][0]['key_id'],
+                package['signing_keys']['gpg_public_keys'][0]['ascii_armor'],
                 package['protocols'],
                 shasums,
                 shasums_signature,
