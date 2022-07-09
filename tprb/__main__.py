@@ -11,6 +11,8 @@ import urllib3
 import zipfile
 import zipimport
 
+from collections import defaultdict
+
 __version__ = '0.3.0'
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -57,7 +59,6 @@ class TFEClient:
             },
             json=json,
             data=data,
-            verify=False
         )
 
     def check_error(self, response):
@@ -183,99 +184,154 @@ def bundle(session, args):
             f.write(script.read())
 
 
+def _upload_provider(archive, client, session, organization, name, versions):
+    _, _, type = name.partition('/')
+
+    response = client.request(
+        'GET',
+        f"/organizations/{organization}/registry-providers/private/{organization}/{type}",
+    )
+    if response.status_code == 404:
+        client.post(
+            f'/organizations/{organization}/registry-providers',
+            {
+                "data": {
+                    "type": "registry-providers",
+                    "attributes": {
+                        "name": type,
+                        "namespace": organization,
+                        "registry-name": "private"
+                    }
+                }
+            }
+        )
+
+    else:
+        response.raise_for_status()
+
+    for v in versions:
+        response = client.request(
+            'DELETE',
+            f'/organizations/{organization}/registry-providers/private/{organization}/{type}/versions/{v.version}',
+        )
+        if response.status_code != 404:
+            client.check_error(response)
+
+        response = client.post(
+            f'/organizations/{organization}/registry-providers/private/{organization}/{type}/versions',
+            json={
+                "data": {
+                    "type": "registry-provider-versions",
+                    "attributes": {
+                        "version": v.version,
+                        "key-id": v.key_id,
+                        "protocols": v.protocols
+                    }
+                }
+            }
+        )
+
+        r = session.put(
+            response['data']['links']['shasums-upload'],
+            data=v.shasums,
+            verify=False
+        )
+        r.raise_for_status()
+
+        r = session.put(
+            response['data']['links']['shasums-sig-upload'],
+            data=v.shasums_signature,
+            verify=False
+        )
+        r.raise_for_status()
+
+        with archive.open(f'providers/{name}/{v.version}/{v.filename}') as f:
+            data = f.read()
+
+        response = client.post(
+            f'/organizations/{organization}/registry-providers/private/{organization}/{type}/versions/{v.version}/platforms',
+            json={
+                "data": {
+                    "type": "registry-provider-version-platforms",
+                    "attributes": {
+                        "os": v.os,
+                        "arch": v.arch,
+                        "shasum": hashlib.sha256(data).hexdigest(),
+                        "filename": v.filename
+                    }
+                }
+            }
+        )
+
+        r = session.put(
+            response['data']['links']['provider-binary-upload'],
+            data=data,
+            verify=False
+        )
+        r.raise_for_status()
+
+
 @command
 def upload(session, args):
     token = os.environ['TFE_TOKEN']
     client = TFEClient(args.tfe_address, token, session=session)
 
     with zipfile.ZipFile('bundle.zip') as archive:
+
+        # Check that the bundle has the expected version
+        with archive.open('VERSION') as f:
+            version = f.read().decode()
+            if version != __version__:
+                raise ValueError(f"Wrong bundle version, expected {__version__!r}, got {version!r}")
+
         with archive.open('versions.json') as f:
             versions = [
-                Version(*e) for e in json.load(f)
+                Version(**e) for e in json.load(f)
             ]
 
-        response = client.request(
-            'GET',
-            f"/organizations/{args.organization}/registry-providers/private/{args.organization}/{args.provider_name}",
-        )
-        if response.status_code == 404:
-            client.post(
-                f'/organizations/{args.organization}/registry-providers',
-                {
-                    "data": {
-                        "type": "registry-providers",
-                        "attributes": {
-                            "name": args.provider_name,
-                            "namespace": args.organization,
-                            "registry-name": "private"
-                        }
-                    }
-                }
-            )
-
-        else:
-            response.raise_for_status()
-
+        providers = defaultdict(list)
         for v in versions:
-            response = client.request(
-                'DELETE',
-                f'/organizations/{args.organization}/registry-providers/private/{args.organization}/{args.provider_name}/versions/{v.version}',
-            )
-            if response.status_code != 404:
-                client.check_error(response)
+            providers[v.name].append(v)
 
-            response = client.post(
-                f'/organizations/{args.organization}/registry-providers/private/{args.organization}/{args.provider_name}/versions',
-                json={
-                    "data": {
-                        "type": "registry-provider-versions",
-                        "attributes": {
-                            "version": v.version,
-                            "key-id": v.key_id,
-                            "protocols": v.protocols
+        for name, versions in providers.items():
+            _upload_provider(archive, client, session, args.organization, name, versions)
+
+        keys = {}
+        for v in versions:
+            keys[v.key_id] = v.key_ascii_armor
+
+        for id, key in keys.items():
+            response = session.request(
+                'GET',
+                f'{client._address}/api/registry/private/v2/gpg-keys/{args.organization}/{id}',
+                headers={
+                    'Authorization': f'Bearer {token}',
+                    'Content-Type': 'application/vnd.api+json'
+                },
+            )
+            if response.status_code == 404:
+                response = session.request(
+                    'POST',
+                    f'{client._address}/api/registry/private/v2/gpg-keys',
+                    headers={
+                        'Authorization': f'Bearer {token}',
+                        'Content-Type': 'application/vnd.api+json'
+                    },
+                    json={
+                        "data": {
+                            "type": "gpg-keys",
+                            "attributes": {
+                                "namespace": args.organization,
+                                "ascii-armor": key
+                            }
                         }
                     }
-                }
-            )
+                )
+                response.raise_for_status()
 
-            r = session.put(
-                response['data']['links']['shasums-upload'],
-                data=v.shasums_url,
-                verify=False
-            )
-            r.raise_for_status()
+            else:
+                response.raise_for_status()
 
-            r = session.put(
-                response['data']['links']['shasums-sig-upload'],
-                data=v.shasums_signature_url,
-                verify=False
-            )
-            r.raise_for_status()
-
-            with archive.open(f'providers/{v.filename}') as f:
-                data = f.read()
-
-            response = client.post(
-                f'/organizations/{args.organization}/registry-providers/private/{args.organization}/{args.provider_name}/versions/{v.version}/platforms',
-                json={
-                      "data": {
-                        "type": "registry-provider-version-platforms",
-                        "attributes": {
-                            "os": args.os,
-                            "arch": args.arch,
-                            "shasum": hashlib.sha256(data).hexdigest(),
-                            "filename": v.filename
-                        }
-                    }
-                }
-            )
-
-            r = session.put(
-                response['data']['links']['provider-binary-upload'],
-                data=data,
-                verify=False
-            )
-            r.raise_for_status()
 
 
 def main():
