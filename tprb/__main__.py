@@ -1,28 +1,33 @@
 import argparse
+import base64
+import dataclasses
+import hashlib
+import json
+import logging
 import os
 import requests
-import zipfile
-import json
-import base64
-import logging
+import sys
 import urllib3
-import hashlib
+import zipfile
+import zipimport
 
-from dataclasses import dataclass
-
+__version__ = '0.2.0'
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logging.basicConfig()
 
 
-@dataclass
+@dataclasses.dataclass
 class Version:
+    name: str
     version: str
     key_id: str
     protocols: list[str]
-    shasums_url: str
-    shasums_signature_url: str
+    shasums: str
+    shasums_signature: str
     filename: str
+    os: str
+    arch: str
 
     def __post_init__(self):
         self.protocols = [
@@ -32,13 +37,17 @@ class Version:
 
 
 class TFEClient:
-    def __init__(self, address, token):
+    def __init__(self, address, token, session=None):
         self._address = address
         self._token = token
-        self.session = requests.Session()
+
+        if session is None:
+            self._session = requests.Session()
+        else:
+            self._session = session
 
     def request(self, method, path, json=None, data=None):
-        return self.session.request(
+        return self._session.request(
             method,
             f'{self._address}/api/v2{path}',
             headers={
@@ -77,81 +86,107 @@ class TFEClient:
 
 
 commands = {}
+
+
 def command(f):
     commands[f.__name__] = f
 
 
 def get_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--version', action='version', version='0.1.0')
-    subparsers = parser.add_subparsers(dest='command')
+    parser.add_argument('--version', action='version', version=__version__)
+    parser.add_argument('--verify', default=True, action=argparse.BooleanOptionalAction)
+
+    subparsers = parser.add_subparsers(dest='command', required=True)
 
     bundle = subparsers.add_parser('bundle')
-    bundle.add_argument('--namespace', required=True)
-    bundle.add_argument('--type', required=True)
+    bundle.add_argument('--provider', nargs='+', required=True)
     bundle.add_argument('--os', required=True)
     bundle.add_argument('--arch', required=True)
 
     upload = subparsers.add_parser('upload')
     upload.add_argument('--tfe-address', required=True)
     upload.add_argument('--organization', required=True)
-    upload.add_argument('--provider-name', required=True)
-    upload.add_argument('--os', required=True)
-    upload.add_argument('--arch', required=True)
 
     return parser
 
 
-@command
-def bundle(args):
-    response = requests.get(f'https://registry.terraform.io/v1/providers/{args.namespace}/{args.type}/versions')
+def _bundle_provider(session, archive, name, os, arch):
+    response = session.get(f'https://registry.terraform.io/v1/providers/{name}/versions')
     response.raise_for_status()
 
-    with zipfile.ZipFile('bundle.zip', 'w') as archive:
-
+    for v in response.json()['versions']:
         versions = []
-        for v in response.json()['versions']:
-            response = requests.get(f'https://registry.terraform.io/v1/providers/{args.namespace}/{args.type}/{v["version"]}/download/{args.os}/{args.arch}')
-            response.raise_for_status()
+        response = session.get(f'https://registry.terraform.io/v1/providers/{name}/{v["version"]}/download/{os}/{arch}')
+        response.raise_for_status()
 
-            package = response.json()
+        package = response.json()
 
-            filename = package['filename']
-            response = requests.get(package['download_url'])
-            response.raise_for_status()
+        filename = package['filename']
+        response = session.get(package['download_url'])
+        response.raise_for_status()
 
-            with archive.open(f'providers/{filename}', 'w') as f:
-                f.write(response.content)
+        with archive.open(f'providers/{name}/{v["version"]}/{filename}', 'w') as f:
+            f.write(response.content)
 
-            response = requests.get(package['shasums_url'])
-            response.raise_for_status()
-            shasums_url = response.text
+        response = session.get(package['shasums_url'])
+        response.raise_for_status()
+        shasums = response.text
 
-            response = requests.get(package['shasums_signature_url'])
-            response.raise_for_status()
-            shasums_signature_url = base64.b64encode(response.content).decode()
+        response = session.get(package['shasums_signature_url'])
+        response.raise_for_status()
+        shasums_signature = base64.b64encode(response.content).decode()
 
-            versions.append(
-                Version(
-                    v['version'],
-                    package['signing_keys']['gpg_public_keys'][0]['key_id'],
-                    package['protocols'],
-                    shasums_url,
-                    shasums_signature_url,
-                    filename
-                )
+        versions.append(
+            Version(
+                name,
+                v['version'],
+                package['signing_keys']['gpg_public_keys'][0]['key_id'],
+                package['protocols'],
+                shasums,
+                shasums_signature,
+                filename,
+                os,
+                arch,
             )
+        )
 
-        data = json.dumps(versions).encode()
+    return versions
+
+
+@command
+def bundle(session, args):
+    versions = []
+
+    with zipfile.ZipFile('bundle.zip', 'w') as archive:
+        for name in args.provider:
+            response = session.get(f'https://registry.terraform.io/v1/providers/{name}/versions')
+            response.raise_for_status()
+
+            versions.extend(_bundle_provider(session, archive, name, args.os, args.arch))
+
+        data = json.dumps([
+            dataclasses.asdict(v) for v in versions
+        ]).encode()
 
         with archive.open('versions.json', 'w') as f:
             f.write(data)
 
+        # We store the version of tprb used to generate the archive so that we
+        # can check when uploading it.
+        with archive.open('VERSION', 'w') as f:
+            f.write(__version__.encode())
+
+        with archive.open('__main__.py', 'w') as f, \
+            open(__file__, 'rb') as script:
+
+            f.write(script.read())
+
 
 @command
-def upload(args):
+def upload(session, args):
     token = os.environ['TFE_TOKEN']
-    client = TFEClient(args.tfe_address, token)
+    client = TFEClient(args.tfe_address, token, session=session)
 
     with zipfile.ZipFile('bundle.zip') as archive:
         with archive.open('versions.json') as f:
@@ -203,14 +238,14 @@ def upload(args):
                 }
             )
 
-            r = requests.put(
+            r = session.put(
                 response['data']['links']['shasums-upload'],
                 data=v.shasums_url,
                 verify=False
             )
             r.raise_for_status()
 
-            r = requests.put(
+            r = session.put(
                 response['data']['links']['shasums-sig-upload'],
                 data=v.shasums_signature_url,
                 verify=False
@@ -235,7 +270,7 @@ def upload(args):
                 }
             )
 
-            r = requests.put(
+            r = session.put(
                 response['data']['links']['provider-binary-upload'],
                 data=data,
                 verify=False
@@ -244,11 +279,17 @@ def upload(args):
 
 
 def main():
+    if isinstance(__loader__, zipimport.zipimporter):
+        sys.argv = ['tprb', 'upload'] + sys.argv[1:]
+
     parser = get_parser()
     args = parser.parse_args()
 
+    session = requests.Session()
+    session.verify = args.verify
+
     command = commands[args.command]
-    command(args)
+    command(session, args)
 
 
 if __name__ == '__main__':
