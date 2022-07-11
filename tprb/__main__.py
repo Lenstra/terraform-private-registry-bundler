@@ -16,7 +16,6 @@ from collections import defaultdict
 __version__ = '0.3.0'
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-logging.basicConfig()
 
 
 @dataclasses.dataclass
@@ -96,6 +95,7 @@ def get_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--version', action='version', version=__version__)
     parser.add_argument('--verify', default=True, action=argparse.BooleanOptionalAction)
+    parser.add_argument('--log-level', '-L', default='WARNING', choices=logging._nameToLevel.keys())
 
     subparsers = parser.add_subparsers(dest='command', required=True)
 
@@ -115,8 +115,9 @@ def _bundle_provider(session, archive, name, os, arch):
     response = session.get(f'https://registry.terraform.io/v1/providers/{name}/versions')
     response.raise_for_status()
 
+    versions = []
     for v in response.json()['versions']:
-        versions = []
+        logging.info('Bundling %s v%s', name, v['version'])
         response = session.get(f'https://registry.terraform.io/v1/providers/{name}/{v["version"]}/download/{os}/{arch}')
         response.raise_for_status()
 
@@ -210,6 +211,7 @@ def _upload_provider(archive, client, session, organization, name, versions):
         response.raise_for_status()
 
     for v in versions:
+        logging.info('Uploading %s v%s', type, v.version)
         response = client.request(
             'DELETE',
             f'/organizations/{organization}/registry-providers/private/{organization}/{type}/versions/{v.version}',
@@ -340,6 +342,8 @@ def main():
 
     parser = get_parser()
     args = parser.parse_args()
+
+    logging.basicConfig(level=args.log_level)
 
     session = requests.Session()
     session.verify = args.verify
