@@ -6,14 +6,12 @@ import json
 import logging
 import os
 import requests
-import sys
 import urllib3
 import zipfile
-import zipimport
 
 from collections import defaultdict
 
-__version__ = '0.3.0'
+__version__ = '0.4.0'
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -28,8 +26,7 @@ class Version:
     shasums: str
     shasums_signature: str
     filename: str
-    os: str
-    arch: str
+    platforms: list[str]
 
     def __post_init__(self):
         self.protocols = [
@@ -101,8 +98,7 @@ def get_parser():
 
     bundle = subparsers.add_parser('bundle')
     bundle.add_argument('--provider', nargs='+', required=True)
-    bundle.add_argument('--os', required=True)
-    bundle.add_argument('--arch', required=True)
+    bundle.add_argument('--platform', nargs='+', required=True)
 
     upload = subparsers.add_parser('upload')
     upload.add_argument('--tfe-address', required=True)
@@ -111,32 +107,33 @@ def get_parser():
     return parser
 
 
-def _bundle_provider(session, archive, name, os, arch):
+def _bundle_provider(session, archive, name, platforms):
     response = session.get(f'https://registry.terraform.io/v1/providers/{name}/versions')
     response.raise_for_status()
 
     versions = []
     for v in response.json()['versions']:
-        logging.info('Bundling %s v%s', name, v['version'])
-        response = session.get(f'https://registry.terraform.io/v1/providers/{name}/{v["version"]}/download/{os}/{arch}')
-        response.raise_for_status()
+        for plaform in platforms:
+            logging.info('Bundling %s v%s for %s', name, v['version'], plaform)
+            response = session.get(f'https://registry.terraform.io/v1/providers/{name}/{v["version"]}/download/{plaform}')
+            response.raise_for_status()
 
-        package = response.json()
+            package = response.json()
 
-        filename = package['filename']
-        response = session.get(package['download_url'])
-        response.raise_for_status()
+            filename = package['filename']
+            response = session.get(package['download_url'])
+            response.raise_for_status()
 
-        with archive.open(f'providers/{name}/{v["version"]}/{filename}', 'w') as f:
-            f.write(response.content)
+            with archive.open(f'providers/{name}/{v["version"]}/{plaform}/{filename}', 'w') as f:
+                f.write(response.content)
 
-        response = session.get(package['shasums_url'])
-        response.raise_for_status()
-        shasums = response.text
+            response = session.get(package['shasums_url'])
+            response.raise_for_status()
+            shasums = response.text
 
-        response = session.get(package['shasums_signature_url'])
-        response.raise_for_status()
-        shasums_signature = base64.b64encode(response.content).decode()
+            response = session.get(package['shasums_signature_url'])
+            response.raise_for_status()
+            shasums_signature = base64.b64encode(response.content).decode()
 
         versions.append(
             Version(
@@ -148,8 +145,7 @@ def _bundle_provider(session, archive, name, os, arch):
                 shasums,
                 shasums_signature,
                 filename,
-                os,
-                arch,
+                platforms=platforms
             )
         )
 
@@ -162,10 +158,7 @@ def bundle(session, args):
 
     with zipfile.ZipFile('bundle.zip', 'w') as archive:
         for name in args.provider:
-            response = session.get(f'https://registry.terraform.io/v1/providers/{name}/versions')
-            response.raise_for_status()
-
-            versions.extend(_bundle_provider(session, archive, name, args.os, args.arch))
+            versions.extend(_bundle_provider(session, archive, name, args.platform))
 
         data = json.dumps([
             dataclasses.asdict(v) for v in versions
@@ -178,11 +171,6 @@ def bundle(session, args):
         # can check when uploading it.
         with archive.open('VERSION', 'w') as f:
             f.write(__version__.encode())
-
-        with archive.open('__main__.py', 'w') as f, \
-            open(__file__, 'rb') as script:
-
-            f.write(script.read())
 
 
 def _upload_provider(archive, client, session, organization, name, versions):
@@ -337,9 +325,6 @@ def upload(session, args):
 
 
 def main():
-    if isinstance(__loader__, zipimport.zipimporter):
-        sys.argv = ['tprb', 'upload'] + sys.argv[1:]
-
     parser = get_parser()
     args = parser.parse_args()
 
