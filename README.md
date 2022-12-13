@@ -9,7 +9,7 @@ shiv -o tprb -p "/usr/bin/env python3" -r requirements.txt --site-packages src -
 ## Usage
 
 ```bash
-./tprb bundle --provider hashicorp/vault --platform linux/amd64 --platform windows/amd64
+./tprb bundle --providers hashicorp/vault --platforms linux/amd64 windows/amd64 --last-releases-only
 ```
 
 ### List of platforms

@@ -5,13 +5,13 @@ import hashlib
 import json
 import logging
 import os
-import requests
-import urllib3
 import zipfile
-
 from collections import defaultdict
 
-__version__ = "0.4.0"
+import requests
+import urllib3
+
+__version__ = "0.5.0"
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -26,7 +26,7 @@ class Version:
     shasums: str
     shasums_signature: str
     filename: str
-    platforms: list[str]
+    platform: str
 
     def __post_init__(self):
         self.protocols = [
@@ -101,16 +101,21 @@ def get_parser():
 
     bundle = subparsers.add_parser("bundle")
     bundle.add_argument(
-        "--provider",
+        "--providers",
         nargs="+",
         required=True,
-        help="Provider as defined by Hashicorp: hashicorp/aws, microsoft/azuredevops...",
+        help="Providers as defined by Hashicorp: hashicorp/aws, microsoft/azuredevops...",
     )
     bundle.add_argument(
-        "--platform",
+        "--platforms",
         nargs="+",
         required=True,
-        help="Platform as defined by Hashicorp: linux/amd64, windows/amd64...",
+        help="Platforms as defined by Hashicorp: linux/amd64, windows/amd64...",
+    )
+    bundle.add_argument(
+        "--last-releases-only",
+        action="store_true",
+        help="Download only the last releases (default to 10)",
     )
 
     upload = subparsers.add_parser("upload")
@@ -120,39 +125,39 @@ def get_parser():
     return parser
 
 
-def _bundle_provider(session, archive, name, platforms):
+def _bundle_provider(session, archive, name, platform, last_releases_only):
+
     response = session.get(
         f"https://registry.terraform.io/v1/providers/{name}/versions"
     )
     response.raise_for_status()
 
     versions = []
-    for v in response.json()["versions"]:
-        for plaform in platforms:
-            logging.info("Bundling %s v%s for %s", name, v["version"], plaform)
-            response = session.get(
-                f'https://registry.terraform.io/v1/providers/{name}/{v["version"]}/download/{plaform}'
-            )
-            response.raise_for_status()
+    for v in response.json()["versions"][-10 if last_releases_only else 0 :]:
+        logging.info("Bundling %s v%s for %s", name, v["version"], platform)
+        response = session.get(
+            f'https://registry.terraform.io/v1/providers/{name}/{v["version"]}/download/{platform}'
+        )
+        response.raise_for_status()
 
-            package = response.json()
+        package = response.json()
 
-            filename = package["filename"]
-            response = session.get(package["download_url"])
-            response.raise_for_status()
+        filename = package["filename"]
+        response = session.get(package["download_url"])
+        response.raise_for_status()
 
-            with archive.open(
-                f'providers/{name}/{v["version"]}/{plaform}/{filename}', "w"
-            ) as f:
-                f.write(response.content)
+        with archive.open(
+            f'providers/{name}/{v["version"]}/{platform}/{filename}', "w"
+        ) as f:
+            f.write(response.content)
 
-            response = session.get(package["shasums_url"])
-            response.raise_for_status()
-            shasums = response.text
+        response = session.get(package["shasums_url"])
+        response.raise_for_status()
+        shasums = response.text
 
-            response = session.get(package["shasums_signature_url"])
-            response.raise_for_status()
-            shasums_signature = base64.b64encode(response.content).decode()
+        response = session.get(package["shasums_signature_url"])
+        response.raise_for_status()
+        shasums_signature = base64.b64encode(response.content).decode()
 
         versions.append(
             Version(
@@ -164,7 +169,7 @@ def _bundle_provider(session, archive, name, platforms):
                 shasums,
                 shasums_signature,
                 filename,
-                platforms=platforms,
+                platform=platform,
             )
         )
 
@@ -176,8 +181,13 @@ def bundle(session, args):
     versions = []
 
     with zipfile.ZipFile("bundle.zip", "w") as archive:
-        for name in args.provider:
-            versions.extend(_bundle_provider(session, archive, name, args.platform))
+        for name in args.providers:
+            for platform in args.platforms:
+                versions.extend(
+                    _bundle_provider(
+                        session, archive, name, platform, args.last_releases_only
+                    )
+                )
 
         data = json.dumps([dataclasses.asdict(v) for v in versions]).encode()
 
@@ -239,19 +249,23 @@ def _upload_provider(archive, client, session, organization, name, versions):
         )
 
         r = session.put(
-            response["data"]["links"]["shasums-upload"], data=v.shasums, verify=False
+            response["data"]["links"]["shasums-upload"],
+            data=v.shasums,
         )
         r.raise_for_status()
 
         r = session.put(
             response["data"]["links"]["shasums-sig-upload"],
-            data=v.shasums_signature,
-            verify=False,
+            data=base64.b64decode(v.shasums_signature.encode()),
         )
         r.raise_for_status()
 
-        with archive.open(f"providers/{name}/{v.version}/{v.filename}") as f:
+        with archive.open(
+            f"providers/{name}/{v.version}/{v.platform}/{v.filename}"
+        ) as f:
             data = f.read()
+
+        os, arch = v.platform.split("/")
 
         response = client.post(
             f"/organizations/{organization}/registry-providers/private/{organization}/{type}/versions/{v.version}/platforms",
@@ -259,8 +273,8 @@ def _upload_provider(archive, client, session, organization, name, versions):
                 "data": {
                     "type": "registry-provider-version-platforms",
                     "attributes": {
-                        "os": v.os,
-                        "arch": v.arch,
+                        "os": os,
+                        "arch": arch,
                         "shasum": hashlib.sha256(data).hexdigest(),
                         "filename": v.filename,
                     },
@@ -269,7 +283,8 @@ def _upload_provider(archive, client, session, organization, name, versions):
         )
 
         r = session.put(
-            response["data"]["links"]["provider-binary-upload"], data=data, verify=False
+            response["data"]["links"]["provider-binary-upload"],
+            data=data,
         )
         r.raise_for_status()
 
@@ -346,6 +361,7 @@ def main():
 
     session = requests.Session()
     session.verify = args.verify
+    session.trust_env = args.verify
 
     command = commands[args.command]
     command(session, args)
