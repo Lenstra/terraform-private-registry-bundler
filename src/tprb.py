@@ -29,9 +29,7 @@ class Version:
     platform: str
 
     def __post_init__(self):
-        self.protocols = [
-            "{:.1f}".format(int(p)) if "." not in p else p for p in self.protocols
-        ]
+        self.protocols = ["{:.1f}".format(int(p)) if "." not in p else p for p in self.protocols]
 
 
 class TFEClient:
@@ -47,7 +45,7 @@ class TFEClient:
     def request(self, method, path, json=None, data=None):
         return self._session.request(
             method,
-            f"{self._address}/api/v2{path}",
+            f"https://{self._address}/api/v2{path}",
             headers={
                 "Authorization": f"Bearer {self._token}",
                 "Content-Type": "application/vnd.api+json",
@@ -119,7 +117,6 @@ def get_parser():
     )
 
     upload = subparsers.add_parser("upload")
-    upload.add_argument("--tfe-address", required=True)
     upload.add_argument("--organization", required=True)
 
     return parser
@@ -127,9 +124,7 @@ def get_parser():
 
 def _bundle_provider(session, archive, name, platform, last_releases_only):
 
-    response = session.get(
-        f"https://registry.terraform.io/v1/providers/{name}/versions"
-    )
+    response = session.get(f"https://registry.terraform.io/v1/providers/{name}/versions")
     response.raise_for_status()
 
     versions = []
@@ -146,9 +141,7 @@ def _bundle_provider(session, archive, name, platform, last_releases_only):
         response = session.get(package["download_url"])
         response.raise_for_status()
 
-        with archive.open(
-            f'providers/{name}/{v["version"]}/{platform}/{filename}', "w"
-        ) as f:
+        with archive.open(f'providers/{name}/{v["version"]}/{platform}/{filename}', "w") as f:
             f.write(response.content)
 
         response = session.get(package["shasums_url"])
@@ -184,15 +177,13 @@ def bundle(session, args):
         for name in args.providers:
             for platform in args.platforms:
                 versions.extend(
-                    _bundle_provider(
-                        session, archive, name, platform, args.last_releases_only
-                    )
+                    _bundle_provider(session, archive, name, platform, args.last_releases_only)
                 )
 
-        data = json.dumps([dataclasses.asdict(v) for v in versions]).encode()
+        data = json.dumps([dataclasses.asdict(v) for v in versions])
 
         with archive.open("versions.json", "w") as f:
-            f.write(data)
+            f.write(data.encode())
 
         # We store the version of tprb used to generate the archive so that we
         # can check when uploading it.
@@ -260,9 +251,7 @@ def _upload_provider(archive, client, session, organization, name, versions):
         )
         r.raise_for_status()
 
-        with archive.open(
-            f"providers/{name}/{v.version}/{v.platform}/{v.filename}"
-        ) as f:
+        with archive.open(f"providers/{name}/{v.version}/{v.platform}/{v.filename}") as f:
             data = f.read()
 
         os, arch = v.platform.split("/")
@@ -291,8 +280,10 @@ def _upload_provider(archive, client, session, organization, name, versions):
 
 @command
 def upload(session, args):
-    token = os.environ["TFE_TOKEN"]
-    client = TFEClient(args.tfe_address, token, session=session)
+    TFE_HOSTNAME = os.environ["TFE_HOSTNAME"]
+    TFE_TOKEN = os.environ["TFE_TOKEN"]
+
+    client = TFEClient(TFE_HOSTNAME, TFE_TOKEN, session=session)
 
     with zipfile.ZipFile("bundle.zip") as archive:
 
@@ -305,16 +296,14 @@ def upload(session, args):
                 )
 
         with archive.open("versions.json") as f:
-            versions = [Version(**e) for e in json.load(f)]
+            versions = [Version(**e) for e in json.loads(f.read().decode())]
 
         providers = defaultdict(list)
         for v in versions:
             providers[v.name].append(v)
 
         for name, versions in providers.items():
-            _upload_provider(
-                archive, client, session, args.organization, name, versions
-            )
+            _upload_provider(archive, client, session, args.organization, name, versions)
 
         keys = {}
         for v in versions:
@@ -323,18 +312,18 @@ def upload(session, args):
         for id, key in keys.items():
             response = session.request(
                 "GET",
-                f"{client._address}/api/registry/private/v2/gpg-keys/{args.organization}/{id}",
+                f"https://{client._address}/api/registry/private/v2/gpg-keys/{args.organization}/{id}",
                 headers={
-                    "Authorization": f"Bearer {token}",
+                    "Authorization": f"Bearer {TFE_TOKEN}",
                     "Content-Type": "application/vnd.api+json",
                 },
             )
             if response.status_code == 404:
                 response = session.request(
                     "POST",
-                    f"{client._address}/api/registry/private/v2/gpg-keys",
+                    f"https://{client._address}/api/registry/private/v2/gpg-keys",
                     headers={
-                        "Authorization": f"Bearer {token}",
+                        "Authorization": f"Bearer {TFE_TOKEN}",
                         "Content-Type": "application/vnd.api+json",
                     },
                     json={
