@@ -2,8 +2,16 @@
 
 ## Package
 
+For Linux :
+
 ```bash
 shiv -o tprb -p "/usr/bin/env python3" -r requirements.txt --site-packages src -e tprb:main
+```
+
+For windows (GitBash) :
+
+```bash
+MSYS_NO_PATHCONV=1 shiv -o tprb -p "python" -r requirements.txt --site-packages src -e tprb:main
 ```
 
 ## Usage
